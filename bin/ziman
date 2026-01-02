@@ -1,0 +1,258 @@
+#!/bin/bash
+# ZIVPN UDP Advanced Password Manager + Status Layanan
+# Fitur: Timer expired + Tampilkan status service zivpn
+
+CONFIG_FILE="/etc/zivpn/config.json"
+DB_FILE="/etc/zivpn/passwords.db"
+SERVICE="zivpn.service"
+LOG_FILE="/var/log/zivpn.log"  # Sesuaikan jika log di tempat lain
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Jalankan dengan sudo!"
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Config tidak ditemukan di $CONFIG_FILE"
+    exit 1
+fi
+
+[ ! -f "$DB_FILE" ] && touch "$DB_FILE"
+
+# Fungsi: bersihkan password kadaluarsa
+cleanup_expired() {
+    local changed=0
+    local today=$(date +%Y-%m-%d)
+
+    while IFS=: read -r pass exp_date; do
+        [[ -z "$pass" || -z "$exp_date" ]] && continue
+        if [[ "$exp_date" < "$today" ]]; then
+            echo "Password '$pass' kadaluarsa pada $exp_date → dihapus otomatis"
+            sed -i "/^${pass}:/d" "$DB_FILE"
+            changed=1
+        fi
+    done < "$DB_FILE"
+
+    if [[ $changed -eq 1 ]]; then
+        sync_passwords_from_db
+    fi
+}
+
+# Sync DB ke config.json
+sync_passwords_from_db() {
+    local valid_passwords=()
+    local today=$(date +%Y-%m-%d)
+
+    while IFS=: read -r pass exp_date; do
+        [[ -z "$pass" ]] && continue
+        if [[ -z "$exp_date" || "$exp_date" >= "$today" ]]; then
+            valid_passwords+=("$pass")
+        fi
+    done < "$DB_FILE"
+
+    if [ ${#valid_passwords[@]} -eq 0 ]; then
+        echo "Error: Tidak ada password valid tersisa!"
+        return 1
+    fi
+
+    PASS_JSON=\( (printf '"%s",' " \){valid_passwords[@]}")
+    PASS_JSON=${PASS_JSON%,}
+
+    cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
+    sed -i -E "s|(\"config\":\s*\[)[^]]*\]|\\1 $PASS_JSON ]|" "$CONFIG_FILE"
+
+    reload_service
+}
+
+# Reload service (prioritas SIGHUP)
+reload_service() {
+    echo -n "Menerapkan perubahan tanpa putus koneksi... "
+    if pkill -SIGHUP -f "zivpn server" > /dev/null 2>&1; then
+        echo "SUKSES (SIGHUP)"
+    elif systemctl reload "$SERVICE" > /dev/null 2>&1; then
+        echo "SUKSES (systemctl reload)"
+    else
+        systemctl restart "$SERVICE"
+        echo "SUKSES (restart - koneksi sementara putus)"
+    fi
+}
+
+# Fungsi: tampilkan status layanan
+show_service_status() {
+    echo "=================================="
+    echo "       STATUS LAYANAN ZIVPN"
+    echo "=================================="
+
+    if systemctl is-active --quiet "$SERVICE"; then
+        STATUS="🟢 Active (Running)"
+        UPTIME=$(systemctl show -p ActiveEnterTimestamp "$SERVICE" | sed 's/ActiveEnterTimestamp=//')
+        if [[ -n "$UPTIME" ]]; then
+            UPTIME_FORMATTED=$(date -d "$UPTIME" '+%d %b %Y %H:%M:%S')
+        else
+            UPTIME_FORMATTED="Tidak diketahui"
+        fi
+    else
+        STATUS="🔴 Inactive / Dead"
+        UPTIME_FORMATTED="-"
+    fi
+
+    # Port dari config
+    LISTEN_PORT=$(grep '"listen"' "$CONFIG_FILE" | grep -o '[0-9]\+' || echo "5667")
+
+    # PID
+    PID=$(pgrep -f "zivpn server" || echo "-")
+
+    # Jumlah koneksi aktif (dari log atau netstat)
+    ACTIVE_CONNS=$(ss -u state established '( sport = :$LISTEN_PORT )' | wc -l)
+    ((ACTIVE_CONNS--))  # kurangi 1 karena header
+
+    echo "Status Service   : $STATUS"
+    echo "Uptime           : $UPTIME_FORMATTED"
+    echo "Listening Port   : $LISTEN_PORT (UDP)"
+    echo "Process PID      : $PID"
+    echo "Active Connections: $ACTIVE_CONNS user(s)"
+    echo "----------------------------------"
+}
+
+# Tampilkan password + expired
+show_passwords() {
+    local today=$(date +%Y-%m-%d)
+    echo "DAFTAR PASSWORD"
+    echo "No | Password       | Expired Date     | Status"
+    echo "---|----------------|------------------|----------"
+    local i=1
+    while IFS=: read -r pass exp_date; do
+        [[ -z "$pass" ]] && continue
+        if [[ -z "$exp_date" ]]; then
+            status="Permanent"
+        elif [[ "$exp_date" < "$today" ]]; then
+            status="EXPIRED"
+        else
+            status="Active"
+        fi
+        printf "%-2s | %-14s | %-16s | %s\n" "$i" "\( pass" " \){exp_date:-Permanent}" "$status"
+        ((i++))
+    done < "$DB_FILE"
+}
+
+# Bersihkan kadaluarsa dulu
+cleanup_expired
+
+# Tampilkan status + menu
+clear
+show_service_status
+show_passwords
+echo ""
+echo "Pilihan Menu:"
+echo "1. Tambah password baru (dengan expired)"
+echo "2. Hapus password"
+echo "3. Ganti semua password"
+echo "4. Ubah/perpanjang expired password"
+echo "5. Keluar"
+read -p "Pilih (1-5): " choice
+
+case $choice in
+    1)
+        read -p "Masukkan password baru (pisah koma untuk multiple): " input_pass
+        [ -z "$input_pass" ] && echo "Dibatalkan." && exit 0
+
+        read -p "Durasi expired (7d, 1m, 3w, 1y, atau Enter=permanent): " duration
+
+        exp_date=""
+        if [[ -n "$duration" ]]; then
+            if [[ \( duration =~ ^([0-9]+)(d|m|w|y) \) ]]; then
+                num=${BASH_REMATCH[1]}
+                unit=${BASH_REMATCH[2]}
+                case $unit in
+                    d) exp_date=\( (date -d "+ \){num} days" +%Y-%m-%d) ;;
+                    w) exp_date=\( (date -d "+ \){num} weeks" +%Y-%m-%d) ;;
+                    m) exp_date=\( (date -d "+ \){num} months" +%Y-%m-%d) ;;
+                    y) exp_date=\( (date -d "+ \){num} years" +%Y-%m-%d) ;;
+                esac
+            else
+                echo "Format salah!"
+                exit 1
+            fi
+        fi
+
+        IFS=',' read -ra NEW_PASS <<< "$(echo "$input_pass" | tr -s ' ')"
+        for pass in "${NEW_PASS[@]}"; do
+            pass=$(echo "$pass" | xargs)
+            [[ -z "$pass" ]] && continue
+            sed -i "/^${pass}:/d" "$DB_FILE"
+            if [[ -n "$exp_date" ]]; then
+                echo "$pass:$exp_date" >> "$DB_FILE"
+                echo "Ditambahkan: $pass (expired: $exp_date)"
+            else
+                echo "$pass:" >> "$DB_FILE"
+                echo "Ditambahkan: $pass (permanent)"
+            fi
+        done
+        sync_passwords_from_db
+        ;;
+    2)
+        read -p "Password yang dihapus (pisah koma): " input
+        [ -z "$input" ] && echo "Dibatalkan." && exit 0
+        IFS=',' read -ra TO_DEL <<< "$(echo "$input" | tr -s ' ')"
+        for del in "${TO_DEL[@]}"; do
+            del=$(echo "$del" | xargs)
+            sed -i "/^${del}:/d" "$DB_FILE"
+            echo "Dihapus: $del"
+        done
+        sync_passwords_from_db
+        ;;
+    3)
+        echo "Semua password akan diganti!"
+        > "$DB_FILE"
+        echo "File DB dikosongkan. Tambah password baru:"
+        "$0"
+        exit 0
+        ;;
+    4)
+        read -p "Password yang ingin diubah expired: " target
+        target=$(echo "$target" | xargs)
+        if ! grep -q "^${target}:" "$DB_FILE"; then
+            echo "Password tidak ditemukan!"
+            exit 1
+        fi
+        read -p "Durasi baru (7d, 1m, dll / Enter=permanent): " duration
+        exp_date=""
+        if [[ -n "$duration" ]]; then
+            if [[ \( duration =~ ^([0-9]+)(d|m|w|y) \) ]]; then
+                num=${BASH_REMATCH[1]}
+                unit=${BASH_REMATCH[2]}
+                case $unit in
+                    d) exp_date=\( (date -d "+ \){num} days" +%Y-%m-%d) ;;
+                    w) exp_date=\( (date -d "+ \){num} weeks" +%Y-%m-%d) ;;
+                    m) exp_date=\( (date -d "+ \){num} months" +%Y-%m-%d) ;;
+                    y) exp_date=\( (date -d "+ \){num} years" +%Y-%m-%d) ;;
+                esac
+            else
+                echo "Format salah!"
+                exit 1
+            fi
+        fi
+        sed -i "/^${target}:/d" "$DB_FILE"
+        if [[ -n "$exp_date" ]]; then
+            echo "$target:$exp_date" >> "$DB_FILE"
+            echo "Diperbarui → expired: $exp_date"
+        else
+            echo "$target:" >> "$DB_FILE"
+            echo "Diperbarui → permanent"
+        fi
+        sync_passwords_from_db
+        ;;
+    5)
+        echo "Keluar."
+        exit 0
+        ;;
+    *)
+        echo "Pilihan tidak valid!"
+        exit 1
+        ;;
+esac
+
+echo ""
+echo "Selesai! Status terbaru:"
+show_service_status
+show_passwords
