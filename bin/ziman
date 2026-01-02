@@ -30,7 +30,8 @@ get_passwords_from_db() {
     local today=$(date +%Y-%m-%d)
     while IFS=: read -r pass exp_date; do
         [[ -z "$pass" ]] && continue
-        if [[ -z "$exp_date" || "$exp_date" >= "$today" ]]; then
+        exp_date="${exp_date:-9999-12-31}"  # default tanggal sangat jauh di masa depan untuk permanent
+        if [[ "$exp_date" == "9999-12-31" ]] || [[ "$exp_date" > "$today" ]] || [[ "$exp_date" == "$today" ]]; then
             echo "$pass"
         fi
     done < "$DB_FILE" | sort
@@ -44,7 +45,7 @@ sync_db_to_config() {
         return 1
     fi
 
-    PASS_JSON=\( (printf '"%s",' " \){valid_passwords[@]}")
+    PASS_JSON=$(printf '"%s",' "${valid_passwords[@]}")
     PASS_JSON=${PASS_JSON%,}
 
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
@@ -68,8 +69,8 @@ check_sync_status() {
     local db_pass=($(get_passwords_from_db))
     local cfg_pass=($(get_passwords_from_config))
 
-    if [ "\( {#db_pass[@]}" -eq " \){#cfg_pass[@]}" ] && \
-       [ "\( (printf '%s\n' " \){db_pass[@]}" | sort)" = "\( (printf '%s\n' " \){cfg_pass[@]}" | sort)" ]; then
+    if [ "${#db_pass[@]}" -eq "${#cfg_pass[@]}" ] && \
+       [ "$(printf '%s\n' "${db_pass[@]}" | sort)" = "$(printf '%s\n' "${cfg_pass[@]}" | sort)" ]; then
         echo "✓ passwords.db dan config.json SUDAH SINKRON"
         return 0
     else
@@ -98,8 +99,9 @@ cleanup_expired() {
     local changed=0
     local today=$(date +%Y-%m-%d)
     while IFS=: read -r pass exp_date; do
-        [[ -z "$pass" || -z "$exp_date" ]] && continue
-        if [[ "$exp_date" < "$today" ]]; then
+        [[ -z "$pass" ]] && continue
+        # Jika ada tanggal expired dan sudah lewat
+        if [[ -n "$exp_date" ]] && [[ "$exp_date" < "$today" ]]; then
             echo "Password '$pass' kadaluarsa → dihapus"
             sed -i "/^${pass}:/d" "$DB_FILE"
             changed=1
@@ -120,7 +122,7 @@ show_service_status() {
     fi
     LISTEN_PORT=$(grep '"listen"' "$CONFIG_FILE" | grep -o '[0-9]\+' || echo "5667")
     PID=$(pgrep -f "zivpn server" || echo "-")
-    ACTIVE_CONNS=$(ss -u state established '( sport = :$LISTEN_PORT )' | wc -l)
+    ACTIVE_CONNS=$(ss -u state established "( sport = :$LISTEN_PORT )" | wc -l)
     ((ACTIVE_CONNS--))
     [ $ACTIVE_CONNS -lt 0 ] && ACTIVE_CONNS=0
 
@@ -147,7 +149,7 @@ show_passwords() {
         else
             status="Active hingga $exp_date"
         fi
-        printf "%-2s | %-14s | %-16s | %s\n" "$i" "\( pass" " \){exp_date:-Permanent}" "$status"
+        printf "%-2s | %-14s | %-16s | %s\n" "$i" "$pass" "${exp_date:-Permanent}" "$status"
         ((i++))
     done < "$DB_FILE"
 }
@@ -158,7 +160,7 @@ cleanup_expired
 check_sync_status || echo "   → Akan otomatis sinkron saat ada perubahan"
 
 # Jika tidak sinkron dan DB kosong, sync dari config
-if ! check_sync_status > /dev/null && [ ! -s "$DB_FILE" ]; then
+if ! check_sync_status > /dev/null 2>&1 && [ ! -s "$DB_FILE" ]; then
     echo "→ DB kosong → sinkron dari config.json"
     sync_config_to_db
 fi
@@ -184,12 +186,15 @@ case $choice in
         read -p "Durasi (7d,1m,3w,1y / Enter=permanent): " duration
         exp_date=""
         if [[ -n "$duration" ]]; then
-            [[ \( duration =~ ^([0-9]+)(d|m|w|y) \) ]] || { echo "Format salah"; exit 1; }
-            num=\( {BASH_REMATCH[1]}; unit= \){BASH_REMATCH[2]}
-            case \( unit in d) exp_date= \)(date -d "+${num} days" +%Y-%m-%d);; 
-                w) exp_date=\( (date -d "+ \){num} weeks" +%Y-%m-%d);;
-                m) exp_date=\( (date -d "+ \){num} months" +%Y-%m-%d);;
-                y) exp_date=\( (date -d "+ \){num} years" +%Y-%m-%d);; esac
+            [[ "$duration" =~ ^([0-9]+)(d|m|w|y)$ ]] || { echo "Format salah"; exit 1; }
+            num="${BASH_REMATCH[1]}"
+            unit="${BASH_REMATCH[2]}"
+            case "$unit" in 
+                d) exp_date=$(date -d "+${num} days" +%Y-%m-%d);; 
+                w) exp_date=$(date -d "+${num} weeks" +%Y-%m-%d);;
+                m) exp_date=$(date -d "+${num} months" +%Y-%m-%d);;
+                y) exp_date=$(date -d "+${num} years" +%Y-%m-%d);; 
+            esac
         fi
         IFS=',' read -ra NEW <<< "${input_pass// /}"
         for p in "${NEW[@]}"; do
@@ -204,7 +209,10 @@ case $choice in
         read -p "Password dihapus (pisah koma): " input
         [ -z "$input" ] && exit 0
         IFS=',' read -ra DEL <<< "${input// /}"
-        for d in "\( {DEL[@]}"; do sed -i "/^ \){d// /}:/d" "$DB_FILE"; done
+        for d in "${DEL[@]}"; do
+            d=$(echo "$d" | xargs)
+            sed -i "/^${d}:/d" "$DB_FILE"
+        done
         sync_db_to_config
         ;;
     3)  # Ubah expired
@@ -214,12 +222,15 @@ case $choice in
         read -p "Durasi baru (7d dll / Enter=permanent): " duration
         exp_date=""
         if [[ -n "$duration" ]]; then
-            [[ \( duration =~ ^([0-9]+)(d|m|w|y) \) ]] || { echo "Format salah"; exit 1; }
-            num=\( {BASH_REMATCH[1]}; unit= \){BASH_REMATCH[2]}
-            case \( unit in d) exp_date= \)(date -d "+${num} days" +%Y-%m-%d);; 
-                w) exp_date=\( (date -d "+ \){num} weeks" +%Y-%m-%d);;
-                m) exp_date=\( (date -d "+ \){num} months" +%Y-%m-%d);;
-                y) exp_date=\( (date -d "+ \){num} years" +%Y-%m-%d);; esac
+            [[ "$duration" =~ ^([0-9]+)(d|m|w|y)$ ]] || { echo "Format salah"; exit 1; }
+            num="${BASH_REMATCH[1]}"
+            unit="${BASH_REMATCH[2]}"
+            case "$unit" in 
+                d) exp_date=$(date -d "+${num} days" +%Y-%m-%d);; 
+                w) exp_date=$(date -d "+${num} weeks" +%Y-%m-%d);;
+                m) exp_date=$(date -d "+${num} months" +%Y-%m-%d);;
+                y) exp_date=$(date -d "+${num} years" +%Y-%m-%d);; 
+            esac
         fi
         sed -i "/^${target}:/d" "$DB_FILE"
         [[ -n "$exp_date" ]] && echo "$target:$exp_date" >> "$DB_FILE" || echo "$target:" >> "$DB_FILE"
@@ -239,6 +250,7 @@ case $choice in
         case $sync_dir in
             1) sync_db_to_config ;;
             2) sync_config_to_db; sync_db_to_config ;;
+            *) echo "Pilihan salah!" ;;
         esac
         ;;
     5) echo "Keluar."; exit 0 ;;
