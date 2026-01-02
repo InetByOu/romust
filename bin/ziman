@@ -1,263 +1,222 @@
-#!/bin/bash
-# ZIVPN UDP Password Manager - Full Sync DB & Config
-# Pastikan passwords.db dan config.json SELALU SAMA
+import json
+import os
+import subprocess
+import re
+from datetime import datetime, timedelta
 
-CONFIG_FILE="/etc/zivpn/config.json"
-DB_FILE="/etc/zivpn/passwords.db"
-SERVICE="zivpn.service"
+CONFIG_FILE = "/etc/zivpn/config.json"
+DB_FILE = "/etc/zivpn/passwords.db"
+SERVICE = "zivpn.service"
 
-if [ "$EUID" -ne 0 ]; then
-    echo "Error: Harap jalankan dengan sudo!"
-    exit 1
-fi
+def load_db():
+    passwords = {}
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if ':' in line:
+                    passw, exp = line.split(':', 1)
+                    passwords[passw] = exp if exp else None
+                elif line:
+                    passwords[line] = None
+    return passwords
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Error: $CONFIG_FILE tidak ditemukan!"
-    exit 1
-fi
+def save_db(passwords):
+    with open(DB_FILE, 'w') as f:
+        for passw, exp in passwords.items():
+            f.write(f"{passw}:{exp or ''}\n")
 
-[ ! -f "$DB_FILE" ] && touch "$DB_FILE"
+def get_valid_passwords():
+    today = datetime.now().strftime('%Y-%m-%d')
+    passwords = load_db()
+    valid = []
+    to_delete = []
+    for passw, exp in passwords.items():
+        if exp and exp < today:
+            print(f"Password '{passw}' kadaluarsa ({exp}) → dihapus otomatis")
+            to_delete.append(passw)
+        else:
+            valid.append(passw)
+    for p in to_delete:
+        del passwords[p]
+    if to_delete:
+        save_db(passwords)
+        sync_to_config(valid)
+    return valid
 
-# Fungsi: ambil password dari config.json
-get_passwords_from_config() {
-    grep -oP '"config":\s*\[\s*(.*?)\s*\]' "$CONFIG_FILE" | \
-    sed -e 's/"config":\[//' -e 's/\]//' -e 's/"//g' -e 's/,/ /g' | \
-    tr ' ' '\n' | grep -v '^$' | sort
-}
+def sync_to_config(valid_passwords):
+    if not valid_passwords:
+        print("Error: Tidak ada password valid tersisa!")
+        return
+    pass_json = ','.join(f'"{p}"' for p in valid_passwords)
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            content = f.read()
+        new_content = re.sub(r'("config":\s*\[)[^\]]*\]', rf'\1{pass_json}]', content)
+        os.rename(CONFIG_FILE, CONFIG_FILE + '.bak')
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(new_content)
+        print("✓ config.json berhasil di-update dari DB")
+        reload_service()
+    except Exception as e:
+        print(f"Error saat sync config: {e}")
 
-# Fungsi: ambil password valid dari DB (yang belum expired)
-get_passwords_from_db() {
-    local today=$(date +%Y-%m-%d)
-    while IFS=: read -r pass exp_date; do
-        [[ -z "$pass" ]] && continue
-        exp_date="${exp_date:-9999-12-31}"  # default tanggal sangat jauh di masa depan untuk permanent
-        if [[ "$exp_date" == "9999-12-31" ]] || [[ "$exp_date" > "$today" ]] || [[ "$exp_date" == "$today" ]]; then
-            echo "$pass"
-        fi
-    done < "$DB_FILE" | sort
-}
+def reload_service():
+    print("Menerapkan perubahan ke service...", end=' ')
+    try:
+        subprocess.run(['pkill', '-SIGHUP', '-f', 'zivpn server'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("SUKSES (SIGHUP)")
+    except:
+        try:
+            subprocess.run(['systemctl', 'reload', SERVICE], check=True)
+            print("SUKSES (reload)")
+        except:
+            subprocess.run(['systemctl', 'restart', SERVICE])
+            print("SUKSES (restart - koneksi sementara putus)")
 
-# Fungsi: sync DB → config.json (DB jadi sumber utama)
-sync_db_to_config() {
-    local valid_passwords=($(get_passwords_from_db))
-    if [ ${#valid_passwords[@]} -eq 0 ]; then
-        echo "Error: Tidak ada password valid di DB!"
-        return 1
-    fi
+def get_service_status():
+    status = "🟢 Active" if subprocess.call(['systemctl', 'is-active', '--quiet', SERVICE]) == 0 else "🔴 Inactive"
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+        port = data.get('listen', 5667)
+    except:
+        port = 5667
+    try:
+        pid = subprocess.check_output(['pgrep', '-f', 'zivpn server']).decode().strip() or "-"
+    except:
+        pid = "-"
+    try:
+        conns_output = subprocess.check_output(['ss', '-u', 'state', 'established', f'( sport = :{port} )'], stderr=subprocess.DEVNULL).decode()
+        conns = conns_output.count('\n') - 1
+        conns = max(conns, 0)
+    except:
+        conns = 0
+    return status, port, pid, conns
 
-    PASS_JSON=$(printf '"%s",' "${valid_passwords[@]}")
-    PASS_JSON=${PASS_JSON%,}
+def show_status():
+    status, port, pid, conns = get_service_status()
+    print("=" * 40)
+    print("           STATUS LAYANAN ZIVPN")
+    print("=" * 40)
+    print(f"Status         : {status}")
+    print(f"Listening Port : {port} (UDP)")
+    print(f"Process PID    : {pid}")
+    print(f"Koneksi Aktif  : {conns} user(s)")
+    print("-" * 40)
 
-    cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
-    sed -i -E "s|(\"config\":\s*\[)[^]]*\]|\\1 $PASS_JSON ]|" "$CONFIG_FILE"
-    echo "✓ config.json berhasil disinkronkan dari passwords.db"
-    reload_service
-}
+def show_passwords():
+    today = datetime.now().strftime('%Y-%m-%d')
+    passwords = load_db()
+    print("DAFTAR PASSWORD")
+    print("No | Password       | Expired Date     | Status")
+    print("---|----------------|------------------|--------------")
+    i = 1
+    for passw, exp in sorted(passwords.items()):
+        if exp and exp < today:
+            stat = "EXPIRED"
+        elif exp is None:
+            stat = "Permanent"
+        else:
+            stat = "Active"
+        print(f"{i:<2} | {passw:<14} | {exp or 'Permanent':<16} | {stat}")
+        i += 1
 
-# Fungsi: sync config.json → DB (jika DB kosong atau force)
-sync_config_to_db() {
-    local config_passwords=($(get_passwords_from_config))
-    > "$DB_FILE"  # kosongkan dulu
-    for pass in "${config_passwords[@]}"; do
-        echo "$pass:" >> "$DB_FILE"  # permanent
-    done
-    echo "✓ passwords.db berhasil disinkronkan dari config.json (semua jadi permanent)"
-}
+def main():
+    if os.geteuid() != 0:
+        print("Error: Script ini harus dijalankan dengan sudo!")
+        return
+    if not os.path.exists(CONFIG_FILE):
+        print(f"Error: File {CONFIG_FILE} tidak ditemukan!")
+        return
 
-# Fungsi: cek apakah sudah sinkron
-check_sync_status() {
-    local db_pass=($(get_passwords_from_db))
-    local cfg_pass=($(get_passwords_from_config))
+    get_valid_passwords()  # Auto cleanup saat start
 
-    if [ "${#db_pass[@]}" -eq "${#cfg_pass[@]}" ] && \
-       [ "$(printf '%s\n' "${db_pass[@]}" | sort)" = "$(printf '%s\n' "${cfg_pass[@]}" | sort)" ]; then
-        echo "✓ passwords.db dan config.json SUDAH SINKRON"
-        return 0
-    else
-        echo "⚠️  passwords.db dan config.json TIDAK SINKRON!"
-        echo "   DB  : ${db_pass[*]:-kosong}"
-        echo "   Config: ${cfg_pass[*]:-kosong}"
-        return 1
-    fi
-}
+    while True:
+        os.system('clear')
+        show_status()
+        show_passwords()
+        print("\n" + "=" * 40)
+        print("           ZIMAN - Python Edition")
+        print("=" * 40)
+        print("1. Tambah password baru (+expired)")
+        print("2. Hapus password")
+        print("3. Ubah/perpanjang expired")
+        print("4. Force sync DB → Config")
+        print("5. Keluar")
+        choice = input("\nPilih menu (1-5): ").strip()
 
-# Fungsi reload service
-reload_service() {
-    echo -n "Menerapkan perubahan (reload tanpa putus koneksi)... "
-    if pkill -SIGHUP -f "zivpn server" > /dev/null 2>&1; then
-        echo "SUKSES (SIGHUP)"
-    elif systemctl reload "$SERVICE" > /dev/null 2>&1; then
-        echo "SUKSES (reload)"
-    else
-        systemctl restart "$SERVICE"
-        echo "SUKSES (restart)"
-    fi
-}
+        if choice == '1':
+            add_password()
+        elif choice == '2':
+            delete_password()
+        elif choice == '3':
+            update_expired()
+        elif choice == '4':
+            sync_to_config(get_valid_passwords())
+        elif choice == '5':
+            print("Keluar dari ZIMAN. Sampai jumpa! 👋")
+            break
+        else:
+            print("Pilihan tidak valid!")
+        input("\nTekan Enter untuk melanjutkan...")
 
-# Bersihkan expired dulu
-cleanup_expired() {
-    local changed=0
-    local today=$(date +%Y-%m-%d)
-    while IFS=: read -r pass exp_date; do
-        [[ -z "$pass" ]] && continue
-        # Jika ada tanggal expired dan sudah lewat
-        if [[ -n "$exp_date" ]] && [[ "$exp_date" < "$today" ]]; then
-            echo "Password '$pass' kadaluarsa → dihapus"
-            sed -i "/^${pass}:/d" "$DB_FILE"
-            changed=1
-        fi
-    done < "$DB_FILE"
-    [[ $changed -eq 1 ]] && sync_db_to_config
-}
+# Fungsi tambahan (sama seperti Bash)
+def add_password():
+    passwords = load_db()
+    input_pass = input("\nMasukkan password baru (pisah dengan koma): ").strip()
+    if not input_pass: return
+    dur = input("Durasi expired (contoh: 7d, 1m, 3w, 1y | Enter = permanent): ").strip().lower()
+    exp = None
+    if dur:
+        match = re.match(r'^(\d+)(d|m|w|y)$', dur)
+        if not match:
+            print("Format durasi salah!")
+            return
+        num, unit = int(match.group(1)), match.group(2)
+        delta_map = {'d': 'days', 'w': 'weeks', 'm': 'days', 'y': 'days'}
+        mult_map = {'m': 30, 'y': 365}
+        days = num * mult_map.get(unit, 1) if unit in ['m','y'] else num
+        exp_date = datetime.now() + timedelta(**{delta_map[unit]: days})
+        exp = exp_date.strftime('%Y-%m-%d')
+    passes = [p.strip() for p in input_pass.split(',') if p.strip()]
+    for p in passes:
+        passwords[p] = exp
+    save_db(passwords)
+    sync_to_config(get_valid_passwords())
 
-# Tampilkan status layanan
-show_service_status() {
-    echo "=================================="
-    echo "       STATUS LAYANAN ZIVPN"
-    echo "=================================="
-    if systemctl is-active --quiet "$SERVICE"; then
-        STATUS="🟢 Active"
-    else
-        STATUS="🔴 Inactive"
-    fi
-    LISTEN_PORT=$(grep '"listen"' "$CONFIG_FILE" | grep -o '[0-9]\+' || echo "5667")
-    PID=$(pgrep -f "zivpn server" || echo "-")
-    ACTIVE_CONNS=$(ss -u state established "( sport = :$LISTEN_PORT )" | wc -l)
-    ((ACTIVE_CONNS--))
-    [ $ACTIVE_CONNS -lt 0 ] && ACTIVE_CONNS=0
+def delete_password():
+    passwords = load_db()
+    input_pass = input("\nMasukkan password yang ingin dihapus (pisah koma): ").strip()
+    if not input_pass: return
+    passes = [p.strip() for p in input_pass.split(',') if p.strip()]
+    for p in passes:
+        passwords.pop(p, None)
+    save_db(passwords)
+    sync_to_config(get_valid_passwords())
 
-    echo "Status        : $STATUS"
-    echo "Port UDP      : $LISTEN_PORT"
-    echo "PID           : $PID"
-    echo "Koneksi Aktif : $ACTIVE_CONNS user"
-    echo "----------------------------------"
-}
+def update_expired():
+    passwords = load_db()
+    target = input("\nMasukkan password yang ingin diubah expired-nya: ").strip()
+    if target not in passwords:
+        print("Password tidak ditemukan!")
+        return
+    dur = input("Durasi baru (7d, 1m, dll | Enter = permanent): ").strip().lower()
+    exp = None
+    if dur:
+        match = re.match(r'^(\d+)(d|m|w|y)$', dur)
+        if not match:
+            print("Format salah!")
+            return
+        num, unit = int(match.group(1)), match.group(2)
+        delta_map = {'d': 'days', 'w': 'weeks', 'm': 'days', 'y': 'days'}
+        mult_map = {'m': 30, 'y': 365}
+        days = num * mult_map.get(unit, 1) if unit in ['m','y'] else num
+        exp_date = datetime.now() + timedelta(**{delta_map[unit]: days})
+        exp = exp_date.strftime('%Y-%m-%d')
+    passwords[target] = exp
+    save_db(passwords)
+    sync_to_config(get_valid_passwords())
 
-# Tampilkan password
-show_passwords() {
-    local today=$(date +%Y-%m-%d)
-    echo "DAFTAR PASSWORD (dari DB)"
-    echo "No | Password       | Expired          | Status"
-    echo "---|----------------|------------------|----------"
-    local i=1
-    while IFS=: read -r pass exp_date; do
-        [[ -z "$pass" ]] && continue
-        if [[ -z "$exp_date" ]]; then
-            status="Permanent"
-        elif [[ "$exp_date" < "$today" ]]; then
-            status="EXPIRED"
-        else
-            status="Active hingga $exp_date"
-        fi
-        printf "%-2s | %-14s | %-16s | %s\n" "$i" "$pass" "${exp_date:-Permanent}" "$status"
-        ((i++))
-    done < "$DB_FILE"
-}
-
-# === MULAI EKSEKUSI ===
-clear
-cleanup_expired
-check_sync_status || echo "   → Akan otomatis sinkron saat ada perubahan"
-
-# Jika tidak sinkron dan DB kosong, sync dari config
-if ! check_sync_status > /dev/null 2>&1 && [ ! -s "$DB_FILE" ]; then
-    echo "→ DB kosong → sinkron dari config.json"
-    sync_config_to_db
-fi
-
-show_service_status
-show_passwords
-echo ""
-check_sync_status
-echo ""
-echo "Menu:"
-echo "1. Tambah password baru (dengan expired)"
-echo "2. Hapus password"
-echo "3. Ubah/perpanjang expired"
-echo "4. Ganti semua password"
-echo "5. Keluar"
-echo "6. Force Sync DB ↔ Config (perbaiki jika tidak sinkron)"
-read -p "Pilih (1-6): " choice
-
-case $choice in
-    1)  # Tambah (sama seperti sebelumnya, lalu sync)
-        read -p "Password baru (pisah koma): " input_pass
-        [ -z "$input_pass" ] && echo "Dibatalkan" && exit 0
-        read -p "Durasi (7d,1m,3w,1y / Enter=permanent): " duration
-        exp_date=""
-        if [[ -n "$duration" ]]; then
-            [[ "$duration" =~ ^([0-9]+)(d|m|w|y)$ ]] || { echo "Format salah"; exit 1; }
-            num="${BASH_REMATCH[1]}"
-            unit="${BASH_REMATCH[2]}"
-            case "$unit" in 
-                d) exp_date=$(date -d "+${num} days" +%Y-%m-%d);; 
-                w) exp_date=$(date -d "+${num} weeks" +%Y-%m-%d);;
-                m) exp_date=$(date -d "+${num} months" +%Y-%m-%d);;
-                y) exp_date=$(date -d "+${num} years" +%Y-%m-%d);; 
-            esac
-        fi
-        IFS=',' read -ra NEW <<< "${input_pass// /}"
-        for p in "${NEW[@]}"; do
-            p=$(echo "$p" | xargs)
-            [[ -z "$p" ]] && continue
-            sed -i "/^${p}:/d" "$DB_FILE"
-            [[ -n "$exp_date" ]] && echo "$p:$exp_date" >> "$DB_FILE" || echo "$p:" >> "$DB_FILE"
-        done
-        sync_db_to_config
-        ;;
-    2)  # Hapus
-        read -p "Password dihapus (pisah koma): " input
-        [ -z "$input" ] && exit 0
-        IFS=',' read -ra DEL <<< "${input// /}"
-        for d in "${DEL[@]}"; do
-            d=$(echo "$d" | xargs)
-            sed -i "/^${d}:/d" "$DB_FILE"
-        done
-        sync_db_to_config
-        ;;
-    3)  # Ubah expired
-        read -p "Password target: " target
-        target=$(echo "$target" | xargs)
-        grep -q "^${target}:" "$DB_FILE" || { echo "Tidak ditemukan!"; exit 1; }
-        read -p "Durasi baru (7d dll / Enter=permanent): " duration
-        exp_date=""
-        if [[ -n "$duration" ]]; then
-            [[ "$duration" =~ ^([0-9]+)(d|m|w|y)$ ]] || { echo "Format salah"; exit 1; }
-            num="${BASH_REMATCH[1]}"
-            unit="${BASH_REMATCH[2]}"
-            case "$unit" in 
-                d) exp_date=$(date -d "+${num} days" +%Y-%m-%d);; 
-                w) exp_date=$(date -d "+${num} weeks" +%Y-%m-%d);;
-                m) exp_date=$(date -d "+${num} months" +%Y-%m-%d);;
-                y) exp_date=$(date -d "+${num} years" +%Y-%m-%d);; 
-            esac
-        fi
-        sed -i "/^${target}:/d" "$DB_FILE"
-        [[ -n "$exp_date" ]] && echo "$target:$exp_date" >> "$DB_FILE" || echo "$target:" >> "$DB_FILE"
-        sync_db_to_config
-        ;;
-    4)  # Ganti semua
-        > "$DB_FILE"
-        echo "DB dikosongkan. Tambah password baru:"
-        "$0"
-        exit 0
-        ;;
-    6)  # Force Sync
-        echo "Pilih arah sinkronisasi:"
-        echo "1. DB → Config (rekomendasi - DB jadi acuan)"
-        echo "2. Config → DB (hanya jika DB rusak)"
-        read -p "Pilih: " sync_dir
-        case $sync_dir in
-            1) sync_db_to_config ;;
-            2) sync_config_to_db; sync_db_to_config ;;
-            *) echo "Pilihan salah!" ;;
-        esac
-        ;;
-    5) echo "Keluar."; exit 0 ;;
-    *) echo "Pilihan salah!" ;;
-esac
-
-echo ""
-echo "Status akhir:"
-check_sync_status
-show_service_status
+if __name__ == "__main__":
+    main()
